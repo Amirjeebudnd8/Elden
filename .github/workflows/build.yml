@@ -1,4 +1,4 @@
-name: Build EXE and Commit to Repo
+name: Build EXE with Data Folder (Zipped)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,6 @@ jobs:
         run: |
           curl -L https://github.com/Ariescyn/EldenRing-Save-Manager/archive/refs/heads/master.zip -o master.zip
           unzip master.zip
-          # نام پوشه داخل zip: EldenRing-Save-Manager-main
           Move-Item -Path EldenRing-Save-Manager-main -Destination src -Force
 
       - name: Set up Python
@@ -37,14 +36,21 @@ jobs:
           cd src
           pyinstaller --onefile --windowed --icon=./data/icon.ico SaveManager.py
 
-      - name: Copy exe to root
+      - name: Prepare release package (exe + data folder)
         run: |
-          Copy-Item -Path src\dist\SaveManager.exe -Destination .\SaveManager.exe
+          New-Item -ItemType Directory -Force release_package
+          Copy-Item src\dist\SaveManager.exe release_package\
+          Copy-Item -Recurse src\data release_package\data
+          Compress-Archive -Path release_package\* -Destination EldenRingSaveManager.zip
 
-      - name: Commit and push the exe
+      - name: Copy zip to repository root
+        run: |
+          Copy-Item EldenRingSaveManager.zip .\EldenRingSaveManager.zip
+
+      - name: Commit and push the zip file
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add SaveManager.exe
-          git commit -m "Add built SaveManager.exe" || echo "No changes to commit"
+          git add EldenRingSaveManager.zip
+          git commit -m "Add EldenRingSaveManager.zip with exe and data" || echo "No changes to commit"
           git push
