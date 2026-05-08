@@ -41,11 +41,7 @@ jobs:
           New-Item -ItemType Directory -Force release_package
           Copy-Item src\dist\SaveManager.exe release_package\
           Copy-Item -Recurse src\data release_package\data
-          Compress-Archive -Path release_package\* -Destination EldenRingSaveManager.zip
-
-      - name: Copy zip to repository root
-        run: |
-          Copy-Item EldenRingSaveManager.zip .\EldenRingSaveManager.zip
+          Compress-Archive -Path release_package\* -DestinationPath EldenRingSaveManager.zip -Force
 
       - name: Commit and push the zip file
         run: |
