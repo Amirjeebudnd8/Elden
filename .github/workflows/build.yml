@@ -1,122 +1,141 @@
-name: 'Triple Protocol Tunnel (All Links in One Log)'
+name: '🔁 Multi-Protocol (Separate Jobs)'
 on: workflow_dispatch
 
 jobs:
-  multi:
+  shadowsocks:
     runs-on: ubuntu-latest
     steps:
-      - name: Install deps
+      - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y curl unzip jq
-
       - name: Download Xray
         run: |
           curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -o /tmp/xray.zip -d /tmp/xray
           sudo cp /tmp/xray/xray /usr/local/bin/
-          sudo chmod +x /usr/local/bin/xray
-
-      - name: Create Xray config with 3 inbounds
+      - name: Config SS
         run: |
           sudo mkdir -p /usr/local/etc/xray
-          cat << 'EOF' | sudo tee /usr/local/etc/xray/config.json
-          {
-            "inbounds": [
-              {
-                "port": 8001,
-                "protocol": "shadowsocks",
-                "settings": {"method": "chacha20-ietf-poly1305", "password": "sspass789"},
-                "streamSettings": {"network": "ws", "wsSettings": {"path": "/ss"}}
-              },
-              {
-                "port": 8002,
-                "protocol": "vmess",
-                "settings": {"clients": [{"id": "b6bdd679-0576-4dbd-b653-bdffdab3bd73", "alterId": 0}]},
-                "streamSettings": {"network": "ws", "wsSettings": {"path": "/vmess"}}
-              },
-              {
-                "port": 8003,
-                "protocol": "vless",
-                "settings": {"clients": [{"id": "b6bdd679-0576-4dbd-b653-bdffdab3bd73"}], "decryption": "none"},
-                "streamSettings": {"network": "ws", "wsSettings": {"path": "/vless"}}
-              }
-            ],
-            "outbounds": [{"protocol": "freedom"}]
-          }
+          cat | sudo tee /usr/local/etc/xray/ss.json << 'EOF'
+          {"inbounds":[{"port":8001,"protocol":"shadowsocks","settings":{"method":"chacha20-ietf-poly1305","password":"sspass789"},"streamSettings":{"network":"ws","wsSettings":{"path":"/ss"}}}],"outbounds":[{"protocol":"freedom"}]}
           EOF
-
-      - name: Start Xray
+      - name: Run Xray
+        run: sudo /usr/local/bin/xray -c /usr/local/etc/xray/ss.json &
+      - name: Download cloudflared (retry)
         run: |
-          sudo /usr/local/bin/xray -c /usr/local/etc/xray/config.json &
-          sleep 3
-
-      - name: Download cloudflared with retry
-        run: |
-          for i in {1..3}; do
+          for i in 1 2 3; do
             curl -L --retry 3 -o /tmp/cf https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && break
-            sleep 2
+            sleep 3
           done
           chmod +x /tmp/cf
           sudo mv /tmp/cf /usr/local/bin/
-
-      - name: Start tunnel on port 8001 (Shadowsocks)
+      - name: Create tunnel and wait for URL
         run: |
-          /usr/local/bin/cloudflared tunnel --url http://localhost:8001 > /tmp/cf1.log 2>&1 &
-          sleep 20
-          URL1=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf1.log | head -1)
-          echo "URL1=$URL1" >> $GITHUB_ENV
-          if [ -z "$URL1" ]; then
-            echo "ERROR: Tunnel1 failed"; cat /tmp/cf1.log; exit 1
-          fi
-
-      - name: Start tunnel on port 8002 (VMess)
+          /usr/local/bin/cloudflared tunnel --url http://localhost:8001 --metrics :21241 > /tmp/cf.log 2>&1 &
+          sleep 5
+          for i in {1..20}; do
+            URL=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then cat /tmp/cf.log; exit 1; fi
+          echo "URL=$URL" >> $GITHUB_ENV
+      - name: Generate SS link
         run: |
-          /usr/local/bin/cloudflared tunnel --url http://localhost:8002 > /tmp/cf2.log 2>&1 &
-          sleep 20
-          URL2=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf2.log | head -1)
-          echo "URL2=$URL2" >> $GITHUB_ENV
-          if [ -z "$URL2" ]; then
-            echo "ERROR: Tunnel2 failed"; cat /tmp/cf2.log; exit 1
-          fi
-
-      - name: Start tunnel on port 8003 (VLESS)
-        run: |
-          /usr/local/bin/cloudflared tunnel --url http://localhost:8003 > /tmp/cf3.log 2>&1 &
-          sleep 20
-          URL3=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf3.log | head -1)
-          echo "URL3=$URL3" >> $GITHUB_ENV
-          if [ -z "$URL3" ]; then
-            echo "ERROR: Tunnel3 failed"; cat /tmp/cf3.log; exit 1
-          fi
-
-      - name: Generate all three links
-        run: |
-          HOST1=$(echo "$URL1" | sed 's|https://||')
-          HOST2=$(echo "$URL2" | sed 's|https://||')
-          HOST3=$(echo "$URL3" | sed 's|https://||')
-          
+          HOST=$(echo "$URL" | sed 's|https://||')
           SS_BASE64=$(echo -n "chacha20-ietf-poly1305:sspass789" | base64 -w 0)
-          SS_LINK="ss://$SS_BASE64@$HOST1:443#GHA-SS"
-          
-          VMESS_JSON="{\"v\":\"2\",\"ps\":\"GHA-VMess\",\"add\":\"$HOST2\",\"port\":\"443\",\"id\":\"b6bdd679-0576-4dbd-b653-bdffdab3bd73\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"$HOST2\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
-          VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
-          
-          VLESS_LINK="vless://b6bdd679-0576-4dbd-b653-bdffdab3bd73@$HOST3:443?encryption=none&security=tls&sni=$HOST3&type=ws&host=$HOST3&path=%2Fvless#GHA-VLESS"
-          
           echo "========================================="
-          echo "🌐 TUNNEL ADDRESSES (for browser test):"
-          echo "$URL1"
-          echo "$URL2"
-          echo "$URL3"
-          echo ""
-          echo "🔗 SHADOWSOCKS (best for NekoRay):"
-          echo "$SS_LINK"
-          echo ""
-          echo "🔗 VMESS+WS:"
-          echo "$VMESS_LINK"
-          echo ""
-          echo "🔗 VLESS+WS:"
-          echo "$VLESS_LINK"
+          echo "✅ SHADOWSOCKS (best for NekoRay)"
+          echo "Link: ss://$SS_BASE64@$HOST:443#GHA-SS"
+          echo "Manual: server=$HOST, port=443, method=chacha20-ietf-poly1305, password=sspass789, plugin=websocket-tls, path=/ss"
           echo "========================================="
+      - name: Keep alive
+        run: sleep 6h
 
+  vmess:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y curl unzip
+      - name: Download Xray
+        run: |
+          curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          sudo cp /tmp/xray/xray /usr/local/bin/
+      - name: Config VMess
+        run: |
+          sudo mkdir -p /usr/local/etc/xray
+          cat | sudo tee /usr/local/etc/xray/vmess.json << 'EOF'
+          {"inbounds":[{"port":8002,"protocol":"vmess","settings":{"clients":[{"id":"b6bdd679-0576-4dbd-b653-bdffdab3bd73","alterId":0}]},"streamSettings":{"network":"ws","wsSettings":{"path":"/vmess"}}}],"outbounds":[{"protocol":"freedom"}]}
+          EOF
+      - name: Run Xray
+        run: sudo /usr/local/bin/xray -c /usr/local/etc/xray/vmess.json &
+      - name: Download cloudflared
+        run: |
+          curl -L --retry 3 -o /tmp/cf https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cf
+          sudo mv /tmp/cf /usr/local/bin/
+      - name: Create tunnel
+        run: |
+          /usr/local/bin/cloudflared tunnel --url http://localhost:8002 --metrics :21242 > /tmp/cf.log 2>&1 &
+          sleep 5
+          for i in {1..20}; do
+            URL=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then cat /tmp/cf.log; exit 1; fi
+          echo "URL=$URL" >> $GITHUB_ENV
+      - name: Generate VMess link
+        run: |
+          HOST=$(echo "$URL" | sed 's|https://||')
+          VMESS_JSON="{\"v\":\"2\",\"ps\":\"GHA-VMess\",\"add\":\"$HOST\",\"port\":\"443\",\"id\":\"b6bdd679-0576-4dbd-b653-bdffdab3bd73\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"$HOST\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
+          VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
+          echo "========================================="
+          echo "✅ VMESS+WS"
+          echo "Link: $VMESS_LINK"
+          echo "========================================="
+      - name: Keep alive
+        run: sleep 6h
+
+  vless:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y curl unzip
+      - name: Download Xray
+        run: |
+          curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          sudo cp /tmp/xray/xray /usr/local/bin/
+      - name: Config VLESS
+        run: |
+          sudo mkdir -p /usr/local/etc/xray
+          cat | sudo tee /usr/local/etc/xray/vless.json << 'EOF'
+          {"inbounds":[{"port":8003,"protocol":"vless","settings":{"clients":[{"id":"b6bdd679-0576-4dbd-b653-bdffdab3bd73"}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/vless"}}}],"outbounds":[{"protocol":"freedom"}]}
+          EOF
+      - name: Run Xray
+        run: sudo /usr/local/bin/xray -c /usr/local/etc/xray/vless.json &
+      - name: Download cloudflared
+        run: |
+          curl -L --retry 3 -o /tmp/cf https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cf
+          sudo mv /tmp/cf /usr/local/bin/
+      - name: Create tunnel
+        run: |
+          /usr/local/bin/cloudflared tunnel --url http://localhost:8003 --metrics :21243 > /tmp/cf.log 2>&1 &
+          sleep 5
+          for i in {1..20}; do
+            URL=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then cat /tmp/cf.log; exit 1; fi
+          echo "URL=$URL" >> $GITHUB_ENV
+      - name: Generate VLESS link
+        run: |
+          HOST=$(echo "$URL" | sed 's|https://||')
+          VLESS_LINK="vless://b6bdd679-0576-4dbd-b653-bdffdab3bd73@$HOST:443?encryption=none&security=tls&sni=$HOST&type=ws&host=$HOST&path=%2Fvless#GHA-VLESS"
+          echo "========================================="
+          echo "✅ VLESS+WS"
+          echo "Link: $VLESS_LINK"
+          echo "========================================="
       - name: Keep alive
         run: sleep 6h
