@@ -1,23 +1,52 @@
-name: 'Create VLESS Tunnel and Config'
+name: 'Create VLESS Tunnel with Full Logging'
 
 on:
-  workflow_dispatch:  # یعنی با یه کلیک روی دکمه، کار اجرا بشه
+  workflow_dispatch:
 
 jobs:
   tunnel:
     runs-on: ubuntu-latest
     steps:
-      - name: Install xray
+      - name: Print start time
         run: |
-          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-          
-      - name: Generate Xray config
+          echo "============================================"
+          echo "Job started at: $(date -u)"
+          echo "============================================"
+
+      - name: Update package list
+        run: sudo apt-get update
+
+      - name: Install prerequisites (curl, jq, grep, sed)
+        run: sudo apt-get install -y curl jq grep sed coreutils
+
+      - name: Download and install Xray core
         run: |
+          echo "--- Downloading Xray install script ---"
+          curl -L -o install-release.sh https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+          echo "--- Script content first 10 lines ---"
+          head -10 install-release.sh
+          echo "--- Running Xray installation ---"
+          bash install-release.sh @ install
+          echo "--- Xray version ---"
+          /usr/local/bin/xray -version
+
+      - name: Create Xray configuration directory
+        run: |
+          mkdir -p /usr/local/etc/xray
           mkdir -p ~/.config
-          cat << 'EOF' > ~/.config/config.json
+
+      - name: Write Xray config.json (verbose)
+        run: |
+          cat << 'EOF' > /usr/local/etc/xray/config.json
           {
+            "log": {
+              "loglevel": "info",
+              "access": "/tmp/xray_access.log",
+              "error": "/tmp/xray_error.log"
+            },
             "inbounds": [
               {
+                "listen": "127.0.0.1",
                 "port": 2087,
                 "protocol": "vless",
                 "settings": {
@@ -33,7 +62,8 @@ jobs:
                   "network": "ws",
                   "security": "none",
                   "wsSettings": {
-                    "path": "/"
+                    "path": "/",
+                    "headers": {}
                   }
                 }
               }
@@ -42,45 +72,94 @@ jobs:
               {
                 "protocol": "freedom",
                 "tag": "direct"
+              },
+              {
+                "protocol": "blackhole",
+                "tag": "block"
               }
             ]
           }
           EOF
-          cat ~/.config/config.json
-          
-      - name: Setup cloudflared
-        uses: cloudflared/setup-cloudflared@v1
-          
-      - name: Start tunnel and generate VLESS link
+          echo "--- config.json content ---"
+          cat /usr/local/etc/xray/config.json
+
+      - name: Start Xray in background
         run: |
-          # Start cloudflared tunnel in background
-          cloudflared tunnel --url http://localhost:2087 > cloudflared.log 2>&1 &
+          /usr/local/bin/xray -c /usr/local/etc/xray/config.json &
+          XRAY_PID=$!
+          echo "Xray started with PID: $XRAY_PID"
+          sleep 3
+          echo "Checking if Xray is listening on port 2087..."
+          ss -tlnp | grep 2087 || netstat -tlnp 2>/dev/null | grep 2087 || echo "Port 2087 check done"
+
+      - name: Download cloudflared binary from GitHub releases
+        run: |
+          echo "--- Downloading cloudflared (latest) ---"
+          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          echo "--- Downloaded file size ---"
+          ls -lh cloudflared
+          echo "--- Applying executable permission ---"
+          chmod +x cloudflared
+          echo "--- Moving to /usr/local/bin ---"
+          sudo mv cloudflared /usr/local/bin/
+          echo "--- cloudflared version ---"
+          /usr/local/bin/cloudflared --version
+
+      - name: Start cloudflared tunnel and capture logs
+        run: |
+          echo "--- Starting cloudflared tunnel to http://localhost:2087 ---"
+          /usr/local/bin/cloudflared tunnel --url http://localhost:2087 --logfile /tmp/cloudflared.log &
           CF_PID=$!
-          
-          # Wait for tunnel to be ready
-          echo "Waiting for tunnel to be ready..."
-          sleep 10
-          
-          # Extract tunnel URL from logs
-          TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9.]*trycloudflare.com' cloudflared.log | head -1)
-          
+          echo "cloudflared PID: $CF_PID"
+          echo "Waiting for tunnel to establish (15 seconds)..."
+          sleep 15
+          echo "--- cloudflared log content ---"
+          cat /tmp/cloudflared.log
+
+      - name: Extract tunnel URL from logs
+        run: |
+          echo "--- Searching for tunnel URL in logs ---"
+          TUNNEL_URL=$(grep -oE 'https://[-a-zA-Z0-9\.]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL"
-            cat cloudflared.log
+            echo "ERROR: Could not find tunnel URL. Full log below:"
+            cat /tmp/cloudflared.log
             exit 1
           fi
-          
-          echo "✅ Tunnel URL: $TUNNEL_URL"
+          echo "✅ Tunnel URL found: $TUNNEL_URL"
           TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
-          UUID="b6bdd679-0576-4dbd-b653-bdffdab3bd73"  # should match the UUID in config.json
-          
-          VLESS_LINK="vless://${UUID}@${TUNNEL_HOST}:443?encryption=none&security=tls&sni=${TUNNEL_HOST}&type=ws&host=${TUNNEL_HOST}&path=%2F#GitHub-Actions-Tunnel"
-          
-          # Print final link
-          echo "=============================================================================="
-          echo "🌐 Your VLESS configuration link:"
+          echo "Tunnel host: $TUNNEL_HOST"
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_ENV
+
+      - name: Generate VLESS link
+        run: |
+          UUID="b6bdd679-0576-4dbd-b653-bdffdab3bd73"
+          HOST="${{ env.TUNNEL_HOST }}"
+          VLESS_LINK="vless://${UUID}@${HOST}:443?encryption=none&security=tls&sni=${HOST}&type=ws&host=${HOST}&path=%2F#GitHub-Actions-Full-Log"
+          echo "=========================================="
+          echo "🌐 VLESS Configuration Link (copy this):"
           echo "$VLESS_LINK"
-          echo "=============================================================================="
-          
-          # Keep tunnel alive
-          wait $CF_PID
+          echo "=========================================="
+          echo "$VLESS_LINK" > /tmp/vless_link.txt
+          echo "VLESS_LINK=$VLESS_LINK" >> $GITHUB_ENV
+
+      - name: Show final summary
+        run: |
+          echo ""
+          echo "========== FINAL SUMMARY =========="
+          echo "Tunnel URL   : ${{ env.TUNNEL_URL }}"
+          echo "VLESS Link   : ${{ env.VLESS_LINK }}"
+          echo "Xray config  : /usr/local/etc/xray/config.json"
+          echo "Cloudflared log: /tmp/cloudflared.log"
+          echo "Xray access log: /tmp/xray_access.log"
+          echo "Xray error log : /tmp/xray_error.log"
+          echo "==================================="
+          echo ""
+          echo "Tunnel will stay alive for 6 hours."
+          echo "You can stop the job manually from GitHub Actions page."
+
+      - name: Keep runner alive (no timeout limit)
+        run: |
+          echo "Entering keep-alive loop for 6 hours (21600 seconds)..."
+          sleep 21600
+          echo "6 hours elapsed. Workflow will now finish."
