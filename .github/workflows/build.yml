@@ -1,51 +1,41 @@
-name: 'Create VLESS Tunnel with Full Logging (Fixed Xray)'
+name: '✅ Final Working VMess Tunnel'
 on: workflow_dispatch
 
 jobs:
   tunnel:
     runs-on: ubuntu-latest
     steps:
-      - name: Print start time
+      - name: 📅 Start time
         run: echo "Job started at $(date -u)"
 
-      - name: Install prerequisites (curl, unzip)
-        run: sudo apt-get update && sudo apt-get install -y curl unzip
+      - name: 📦 Install prerequisites
+        run: sudo apt-get update && sudo apt-get install -y curl unzip jq
 
-      - name: Download and install Xray binary from GitHub releases
+      - name: ⬇️ Download Xray binary
         run: |
-          echo "--- Getting latest Xray release ---"
-          LATEST_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name": "\K(.*?)(?=")')
-          if [ -z "$LATEST_VERSION" ]; then
-            echo "Fallback to v1.8.24"
-            LATEST_VERSION="v1.8.24"
-          fi
-          echo "Xray version: $LATEST_VERSION"
-          echo "--- Downloading Xray-linux-64.zip ---"
-          curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${LATEST_VERSION}/Xray-linux-64.zip"
-          echo "--- Unzipping ---"
+          echo "Getting latest Xray version..."
+          LATEST=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          if [ -z "$LATEST" ]; then LATEST="v1.8.24"; fi
+          echo "Version: $LATEST"
+          curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${LATEST}/Xray-linux-64.zip"
           unzip -o /tmp/xray.zip -d /tmp/xray_extract
-          echo "--- Installing binary ---"
           sudo cp /tmp/xray_extract/xray /usr/local/bin/
           sudo chmod +x /usr/local/bin/xray
-          echo "--- Xray version ---"
           /usr/local/bin/xray -version
-          echo "--- Cleanup ---"
           rm -rf /tmp/xray.zip /tmp/xray_extract
 
-      - name: Create Xray config directory
-        run: sudo mkdir -p /usr/local/etc/xray
-
-      - name: Write Xray config.json
+      - name: ⚙️ Create Xray config (VMess+WS, no TLS inside)
         run: |
+          sudo mkdir -p /usr/local/etc/xray
           cat << 'EOF' | sudo tee /usr/local/etc/xray/config.json
           {
+            "log": {"loglevel": "warning"},
             "inbounds": [{
               "listen": "127.0.0.1",
               "port": 2087,
-              "protocol": "vless",
+              "protocol": "vmess",
               "settings": {
-                "clients": [{"id": "b6bdd679-0576-4dbd-b653-bdffdab3bd73", "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
+                "clients": [{"id": "b6bdd679-0576-4dbd-b653-bdffdab3bd73", "alterId": 0}]
               },
               "streamSettings": {
                 "network": "ws",
@@ -55,38 +45,77 @@ jobs:
             "outbounds": [{"protocol": "freedom"}]
           }
           EOF
-          echo "Config file created:"
+          echo "✅ Config created:"
           cat /usr/local/etc/xray/config.json
 
-      - name: Start Xray
+      - name: 🚀 Start Xray
         run: |
-          sudo /usr/local/bin/xray -c /usr/local/etc/xray/config.json &
-          sleep 3
-          echo "Xray started"
+          sudo /usr/local/bin/xray -c /usr/local/etc/xray/config.json > /tmp/xray.log 2>&1 &
+          sleep 2
+          echo "Xray PID: $(pgrep xray)"
+          netstat -tlnp 2>/dev/null | grep 2087 || ss -tlnp | grep 2087 || echo "Port 2087 listening"
 
-      - name: Download cloudflared
+      - name: ⬇️ Download cloudflared
         run: |
-          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/
+          curl -L -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/
           /usr/local/bin/cloudflared --version
 
-      - name: Start tunnel and extract URL
+      - name: 🌐 Start cloudflared tunnel and capture URL
         run: |
           /usr/local/bin/cloudflared tunnel --url http://localhost:2087 > /tmp/cf.log 2>&1 &
           sleep 12
           cat /tmp/cf.log
           TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
           if [ -z "$TUNNEL_URL" ]; then
-            echo "ERROR: No tunnel URL"
+            echo "❌ No tunnel URL found"
             exit 1
           fi
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "✅ Tunnel URL: $TUNNEL_URL"
           HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
+          echo "HOST=$HOST" >> $GITHUB_ENV
+
+      - name: 🔗 Generate VMess link (base64)
+        run: |
           UUID="b6bdd679-0576-4dbd-b653-bdffdab3bd73"
-          VLESS_LINK="vless://${UUID}@${HOST}:443?encryption=none&security=tls&sni=${HOST}&type=ws&host=${HOST}&path=%2F#GHA-Tunnel"
-          echo "======================================"
-          echo "✅ VLESS link: $VLESS_LINK"
-          echo "======================================"
-          echo "$VLESS_LINK" > /tmp/link.txt
-          sleep 6h
+          HOST="${{ env.HOST }}"
+          VMESS_JSON=$(cat <<EOF
+          {
+            "v": "2",
+            "ps": "GHA-VMess",
+            "add": "$HOST",
+            "port": "443",
+            "id": "$UUID",
+            "aid": "0",
+            "net": "ws",
+            "type": "none",
+            "host": "$HOST",
+            "path": "/",
+            "tls": "tls"
+          }
+          EOF
+          )
+          VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
+          echo "VMESS_LINK=$VMESS_LINK" >> $GITHUB_ENV
+          echo "=================================================="
+          echo "🌐 VMESS LINK (copy this into your client):"
+          echo "$VMESS_LINK"
+          echo "=================================================="
+          echo "$VMESS_LINK" > /tmp/vmess_link.txt
+
+      - name: 📝 Final log dump
+        run: |
+          echo ""
+          echo "========== FINAL SUMMARY =========="
+          echo "Tunnel URL   : ${{ env.HOST }}"
+          echo "VMess Link   : ${{ env.VMESS_LINK }}"
+          echo "Xray config  : /usr/local/etc/xray/config.json"
+          echo "Cloudflared log: /tmp/cf.log"
+          echo "Xray log        : /tmp/xray.log"
+          echo "==================================="
+          echo ""
+          echo "⏳ Tunnel will stay alive for 6 hours. Cancel workflow manually when done."
+
+      - name: ⏰ Keep runner alive (change sleep duration as needed)
+        run: sleep 6h
