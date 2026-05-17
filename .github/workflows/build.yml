@@ -1,98 +1,151 @@
-name: '✅ Final Working Tunnel for NekoRay (SS+WS)'
+name: 'Multi-Protocol Parallel Tunnels (Test & Choose)'
 on: workflow_dispatch
 
 jobs:
-  tunnel:
+  shadowsocks:
     runs-on: ubuntu-latest
     steps:
-      - name: 📅 Start time
-        run: echo "Job started at $(date -u)"
-
-      - name: 📦 Install tools
-        run: sudo apt-get update && sudo apt-get install -y curl unzip jq netcat
-
-      - name: ⬇️ Download Xray
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y curl unzip jq
+      - name: Download Xray
         run: |
-          LATEST=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-          curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${LATEST}/Xray-linux-64.zip"
+          curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -o /tmp/xray.zip -d /tmp/xray
           sudo cp /tmp/xray/xray /usr/local/bin/
           sudo chmod +x /usr/local/bin/xray
-
-      - name: ⚙️ Create Shadowsocks + WebSocket config (no TLS inside)
+      - name: Xray config (Shadowsocks+WS)
         run: |
           sudo mkdir -p /usr/local/etc/xray
-          cat << 'EOF' | sudo tee /usr/local/etc/xray/config.json
+          sudo tee /usr/local/etc/xray/ss.json > /dev/null <<EOF
           {
-            "log": {"loglevel": "warning"},
             "inbounds": [{
-              "listen": "127.0.0.1",
-              "port": 9000,
+              "port": 8001,
               "protocol": "shadowsocks",
-              "settings": {
-                "method": "chacha20-ietf-poly1305",
-                "password": "sspass123",
-                "network": "tcp,udp"
-              },
-              "streamSettings": {
-                "network": "ws",
-                "wsSettings": {
-                  "path": "/ss"
-                }
-              }
+              "settings": {"method": "chacha20-ietf-poly1305", "password": "sspass789"},
+              "streamSettings": {"network": "ws", "wsSettings": {"path": "/ss"}}
             }],
             "outbounds": [{"protocol": "freedom"}]
           }
           EOF
-
-      - name: 🚀 Start Xray
+      - name: Start Xray
+        run: sudo /usr/local/bin/xray -c /usr/local/etc/xray/ss.json &
+      - name: Download cloudflared (with retry)
         run: |
-          sudo /usr/local/bin/xray -c /usr/local/etc/xray/config.json &
-          sleep 3
-          echo "Xray is running"
-
-      - name: ⬇️ Download cloudflared
+          for i in {1..3}; do
+            curl -L --retry 3 -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && break
+            sleep 2
+          done
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/
+      - name: Start tunnel and get URL
         run: |
-          curl -L -o /tmp/cf https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          /usr/local/bin/cloudflared tunnel --url http://localhost:8001 > /tmp/cf.log 2>&1 &
+          sleep 15
+          URL=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+          echo "URL=$URL" >> $GITHUB_ENV
+      - name: Generate SS link
+        run: |
+          HOST=$(echo "$URL" | sed 's|https://||')
+          SS_BASE64=$(echo -n "chacha20-ietf-poly1305:sspass789" | base64 -w 0)
+          echo "========================================="
+          echo "✅ SHADOWSOCKS (try this first)"
+          echo "Link: ss://$SS_BASE64@$HOST:443#SS-GHA"
+          echo "Manual: server=$HOST, port=443, method=chacha20-ietf-poly1305, password=sspass789, plugin=websocket-tls, path=/ss"
+          echo "========================================="
+      - name: Keep alive
+        run: sleep 6h
+
+  vmess:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y curl unzip jq
+      - name: Download Xray
+        run: |
+          curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          sudo cp /tmp/xray/xray /usr/local/bin/
+      - name: Xray config (VMess+WS)
+        run: |
+          sudo mkdir -p /usr/local/etc/xray
+          sudo tee /usr/local/etc/xray/vmess.json > /dev/null <<EOF
+          {
+            "inbounds": [{
+              "port": 8002,
+              "protocol": "vmess",
+              "settings": {"clients": [{"id": "b6bdd679-0576-4dbd-b653-bdffdab3bd73", "alterId": 0}]},
+              "streamSettings": {"network": "ws", "wsSettings": {"path": "/vmess"}}
+            }],
+            "outbounds": [{"protocol": "freedom"}]
+          }
+          EOF
+      - name: Start Xray
+        run: sudo /usr/local/bin/xray -c /usr/local/etc/xray/vmess.json &
+      - name: Download cloudflared
+        run: |
+          curl -L --retry 3 -o /tmp/cf https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cf
           sudo mv /tmp/cf /usr/local/bin/
-
-      - name: 🌐 Start tunnel
+      - name: Start tunnel
         run: |
-          /usr/local/bin/cloudflared tunnel --url http://localhost:9000 > /tmp/cf.log 2>&1 &
+          /usr/local/bin/cloudflared tunnel --url http://localhost:8002 > /tmp/cf.log 2>&1 &
           sleep 15
-          cat /tmp/cf.log
-          TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
-          if [ -z "$TUNNEL_URL" ]; then exit 1; fi
-          HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
-          echo "HOST=$HOST" >> $GITHUB_ENV
-
-      - name: 🔗 Generate NekoRay-compatible link (SIP002 format)
+          URL=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+          echo "URL=$URL" >> $GITHUB_ENV
+      - name: Generate VMess link
         run: |
-          HOST="${{ env.HOST }}"
-          PASSWORD="sspass123"
-          METHOD="chacha20-ietf-poly1305"
-          # SIP002 format: ss://METHOD:PASSWORD@HOST:443?plugin=... 
-          # But NekoRay supports standard ss:// without plugin for WS
-          # Better to output manual config
-          echo "=================================================="
-          echo "✅ TUNNEL ACTIVE. Use these settings in NekoRay:"
-          echo ""
-          echo "Server Address: $HOST"
-          echo "Port: 443"
-          echo "Protocol: Shadowsocks"
-          echo "Method: $METHOD"
-          echo "Password: $PASSWORD"
-          echo "Plugin: none (or websocket-tls)"
-          echo "WebSocket Path: /ss"
-          echo "TLS: Enabled (because cloudflared provides TLS)"
-          echo ""
-          echo "Or use this ss:// link (may work directly):"
-          SS_LINK="ss://$(echo -n "$METHOD:$PASSWORD" | base64 -w 0)@$HOST:443#GHA-SS"
-          echo "$SS_LINK"
-          echo ""
-          echo "🌐 Also test in browser: ${{ env.TUNNEL_URL }}/ss"
-          echo "=================================================="
+          HOST=$(echo "$URL" | sed 's|https://||')
+          VMESS_JSON="{\"v\":\"2\",\"ps\":\"GHA-VMess\",\"add\":\"$HOST\",\"port\":\"443\",\"id\":\"b6bdd679-0576-4dbd-b653-bdffdab3bd73\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"$HOST\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
+          VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
+          echo "========================================="
+          echo "✅ VMESS+WS (try if SS fails)"
+          echo "Link: $VMESS_LINK"
+          echo "========================================="
+      - name: Keep alive
+        run: sleep 6h
 
-      - name: ⏰ Keep alive
+  vless:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y curl unzip
+      - name: Download Xray
+        run: |
+          curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          sudo cp /tmp/xray/xray /usr/local/bin/
+      - name: Xray config (VLESS+WS)
+        run: |
+          sudo mkdir -p /usr/local/etc/xray
+          sudo tee /usr/local/etc/xray/vless.json > /dev/null <<EOF
+          {
+            "inbounds": [{
+              "port": 8003,
+              "protocol": "vless",
+              "settings": {"clients": [{"id": "b6bdd679-0576-4dbd-b653-bdffdab3bd73"}], "decryption": "none"},
+              "streamSettings": {"network": "ws", "wsSettings": {"path": "/vless"}}
+            }],
+            "outbounds": [{"protocol": "freedom"}]
+          }
+          EOF
+      - name: Start Xray
+        run: sudo /usr/local/bin/xray -c /usr/local/etc/xray/vless.json &
+      - name: Download cloudflared
+        run: |
+          curl -L --retry 3 -o /tmp/cf https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cf
+          sudo mv /tmp/cf /usr/local/bin/
+      - name: Start tunnel
+        run: |
+          /usr/local/bin/cloudflared tunnel --url http://localhost:8003 > /tmp/cf.log 2>&1 &
+          sleep 15
+          URL=$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+          echo "URL=$URL" >> $GITHUB_ENV
+      - name: Generate VLESS link
+        run: |
+          HOST=$(echo "$URL" | sed 's|https://||')
+          VLESS_LINK="vless://b6bdd679-0576-4dbd-b653-bdffdab3bd73@$HOST:443?encryption=none&security=tls&sni=$HOST&type=ws&host=$HOST&path=%2Fvless#GHA-VLESS"
+          echo "========================================="
+          echo "✅ VLESS+WS (try last)"
+          echo "Link: $VLESS_LINK"
+          echo "========================================="
+      - name: Keep alive
         run: sleep 6h
